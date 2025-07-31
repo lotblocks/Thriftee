@@ -1,0 +1,68 @@
+[workspace]
+members = [
+    "backend",
+    "contracts",
+    "shared",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# Async runtime and web framework
+tokio = { version = "1.0", features = ["full"] }
+actix-web = "4.4"
+actix-cors = "0.6"
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "decimal", "json"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Authentication
+jsonwebtoken = "9.2"
+bcrypt = "0.15"
+
+# UUID and time
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Decimal for financial calculations
+rust_decimal = { version = "1.0", features = ["serde-float"] }
+
+# Environment variables
+dotenvy = "0.15"
+dotenv = "0.15"
+
+# Blockchain integration
+ethers = { version = "2.0", features = ["ws", "rustls"] }
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json"] }
+
+# WebSocket
+actix-web-actors = "4.2"
+
+# Validation
+validator = { version = "0.16", features = ["derive"] }
+
+# Configuration
+config = "0.13"
+
+[profile.dev]
+debug = true
+opt-level = 0
+
+[profile.release]
+debug = false
+opt-level = 3
+lto = true
+codegen-units = 1

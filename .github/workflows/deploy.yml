@@ -1,0 +1,466 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+      skip_tests:
+        description: 'Skip tests before deployment'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Pre-deployment checks
+  pre-deployment:
+    name: Pre-deployment Checks
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.determine-env.outputs.environment }}
+      version: ${{ steps.version.outputs.version }}
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Determine environment
+      id: determine-env
+      run: |
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+        elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+          echo "environment=staging" >> $GITHUB_OUTPUT
+        elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+          echo "environment=production" >> $GITHUB_OUTPUT
+        else
+          echo "environment=staging" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Generate version
+      id: version
+      run: |
+        if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+          echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        else
+          echo "version=${{ github.sha }}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Validate deployment
+      run: |
+        echo "Deploying version ${{ steps.version.outputs.version }} to ${{ steps.determine-env.outputs.environment }}"
+
+  # Database Migration
+  database-migration:
+    name: Database Migration
+    runs-on: ubuntu-latest
+    needs: pre-deployment
+    environment: ${{ needs.pre-deployment.outputs.environment }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubectl
+      run: |
+        echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig
+        export KUBECONFIG=kubeconfig
+        kubectl config current-context
+
+    - name: Create database backup
+      run: |
+        export KUBECONFIG=kubeconfig
+        kubectl exec -n raffle-platform deployment/postgres -- pg_dump -U raffle_user raffle_platform_prod > backup-$(date +%Y%m%d-%H%M%S).sql
+        
+        # Upload backup to cloud storage
+        aws s3 cp backup-*.sql s3://raffle-platform-backups/$(date +%Y%m%d)/
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: us-east-1
+
+    - name: Run database migrations
+      run: |
+        export KUBECONFIG=kubeconfig
+        
+        # Create migration job
+        kubectl create job migration-${{ needs.pre-deployment.outputs.version }} \
+          --from=cronjob/database-migration \
+          --namespace=raffle-platform
+        
+        # Wait for migration to complete
+        kubectl wait --for=condition=complete --timeout=600s job/migration-${{ needs.pre-deployment.outputs.version }} -n raffle-platform
+        
+        # Check migration status
+        if kubectl get job migration-${{ needs.pre-deployment.outputs.version }} -n raffle-platform -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' | grep -q True; then
+          echo "Migration failed"
+          kubectl logs job/migration-${{ needs.pre-deployment.outputs.version }} -n raffle-platform
+          exit 1
+        fi
+
+  # Smart Contract Deployment
+  smart-contract-deployment:
+    name: Smart Contract Deployment
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, database-migration]
+    environment: ${{ needs.pre-deployment.outputs.environment }}
+    if: needs.pre-deployment.outputs.environment == 'production'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: contracts/package-lock.json
+
+    - name: Install dependencies
+      run: |
+        cd contracts
+        npm ci
+
+    - name: Deploy contracts to mainnet
+      run: |
+        cd contracts
+        npx hardhat run scripts/deploy.js --network polygon
+      env:
+        POLYGON_RPC_URL: ${{ secrets.POLYGON_RPC_URL }}
+        DEPLOYER_PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+        ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
+
+    - name: Verify contracts
+      run: |
+        cd contracts
+        npx hardhat run scripts/validate-deployment.js --network polygon
+      env:
+        POLYGON_RPC_URL: ${{ secrets.POLYGON_RPC_URL }}
+        CONTRACT_ADDRESS: ${{ secrets.CONTRACT_ADDRESS }}
+
+  # Application Deployment
+  deploy-application:
+    name: Deploy Application
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, database-migration]
+    environment: ${{ needs.pre-deployment.outputs.environment }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubectl
+      run: |
+        echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig
+        export KUBECONFIG=kubeconfig
+
+    - name: Update deployment images
+      run: |
+        export KUBECONFIG=kubeconfig
+        
+        # Update backend deployment
+        kubectl set image deployment/raffle-backend \
+          raffle-backend=raffleplatform/backend:${{ needs.pre-deployment.outputs.version }} \
+          --namespace=raffle-platform
+        
+        # Update frontend deployment
+        kubectl set image deployment/raffle-frontend \
+          raffle-frontend=raffleplatform/frontend:${{ needs.pre-deployment.outputs.version }} \
+          --namespace=raffle-platform
+
+    - name: Wait for deployment rollout
+      run: |
+        export KUBECONFIG=kubeconfig
+        
+        # Wait for backend rollout
+        kubectl rollout status deployment/raffle-backend --timeout=600s --namespace=raffle-platform
+        
+        # Wait for frontend rollout
+        kubectl rollout status deployment/raffle-frontend --timeout=600s --namespace=raffle-platform
+
+    - name: Run health checks
+      run: |
+        export KUBECONFIG=kubeconfig
+        
+        # Wait for pods to be ready
+        kubectl wait --for=condition=ready pod -l app=raffle-backend --timeout=300s --namespace=raffle-platform
+        kubectl wait --for=condition=ready pod -l app=raffle-frontend --timeout=300s --namespace=raffle-platform
+        
+        # Test API health
+        API_URL="https://api.raffleplatform.com"
+        if [ "${{ needs.pre-deployment.outputs.environment }}" == "staging" ]; then
+          API_URL="https://api-staging.raffleplatform.com"
+        fi
+        
+        for i in {1..30}; do
+          if curl -f "$API_URL/health" > /dev/null 2>&1; then
+            echo "API health check passed"
+            break
+          fi
+          echo "Waiting for API to be ready... ($i/30)"
+          sleep 10
+        done
+        
+        # Test frontend
+        FRONTEND_URL="https://raffleplatform.com"
+        if [ "${{ needs.pre-deployment.outputs.environment }}" == "staging" ]; then
+          FRONTEND_URL="https://staging.raffleplatform.com"
+        fi
+        
+        if curl -f "$FRONTEND_URL" > /dev/null 2>&1; then
+          echo "Frontend health check passed"
+        else
+          echo "Frontend health check failed"
+          exit 1
+        fi
+
+  # Smoke Tests
+  smoke-tests:
+    name: Smoke Tests
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, deploy-application]
+    environment: ${{ needs.pre-deployment.outputs.environment }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+
+    - name: Install test dependencies
+      run: |
+        npm install -g newman
+        cd tests/smoke
+        npm ci
+
+    - name: Run API smoke tests
+      run: |
+        API_URL="https://api.raffleplatform.com"
+        if [ "${{ needs.pre-deployment.outputs.environment }}" == "staging" ]; then
+          API_URL="https://api-staging.raffleplatform.com"
+        fi
+        
+        newman run tests/smoke/api-smoke-tests.json \
+          --env-var "base_url=$API_URL" \
+          --reporters cli,json \
+          --reporter-json-export smoke-test-results.json
+
+    - name: Run E2E smoke tests
+      run: |
+        cd tests/smoke
+        FRONTEND_URL="https://raffleplatform.com"
+        if [ "${{ needs.pre-deployment.outputs.environment }}" == "staging" ]; then
+          FRONTEND_URL="https://staging.raffleplatform.com"
+        fi
+        
+        npm run test:e2e -- --base-url="$FRONTEND_URL"
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: smoke-test-results
+        path: |
+          smoke-test-results.json
+          tests/smoke/test-results/
+
+  # Rollback on failure
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, deploy-application, smoke-tests]
+    environment: ${{ needs.pre-deployment.outputs.environment }}
+    if: failure()
+    
+    steps:
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubectl
+      run: |
+        echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig
+        export KUBECONFIG=kubeconfig
+
+    - name: Rollback deployment
+      run: |
+        export KUBECONFIG=kubeconfig
+        
+        echo "Rolling back deployment due to failure..."
+        
+        # Rollback backend
+        kubectl rollout undo deployment/raffle-backend --namespace=raffle-platform
+        
+        # Rollback frontend
+        kubectl rollout undo deployment/raffle-frontend --namespace=raffle-platform
+        
+        # Wait for rollback to complete
+        kubectl rollout status deployment/raffle-backend --timeout=600s --namespace=raffle-platform
+        kubectl rollout status deployment/raffle-frontend --timeout=600s --namespace=raffle-platform
+
+    - name: Restore database backup
+      run: |
+        export KUBECONFIG=kubeconfig
+        
+        # Get latest backup
+        LATEST_BACKUP=$(aws s3 ls s3://raffle-platform-backups/$(date +%Y%m%d)/ | sort | tail -n 1 | awk '{print $4}')
+        
+        if [ -n "$LATEST_BACKUP" ]; then
+          echo "Restoring database from backup: $LATEST_BACKUP"
+          aws s3 cp s3://raffle-platform-backups/$(date +%Y%m%d)/$LATEST_BACKUP backup.sql
+          
+          # Restore database
+          kubectl exec -i -n raffle-platform deployment/postgres -- psql -U raffle_user raffle_platform_prod < backup.sql
+        fi
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: us-east-1
+
+  # Post-deployment tasks
+  post-deployment:
+    name: Post-deployment Tasks
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, deploy-application, smoke-tests]
+    environment: ${{ needs.pre-deployment.outputs.environment }}
+    if: success()
+    
+    steps:
+    - name: Update monitoring dashboards
+      run: |
+        # Update Grafana dashboards with new version
+        curl -X POST \
+          -H "Authorization: Bearer ${{ secrets.GRAFANA_API_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          -d '{"dashboard": {"version": "${{ needs.pre-deployment.outputs.version }}"}}' \
+          https://grafana.raffleplatform.com/api/dashboards/db
+
+    - name: Clear CDN cache
+      run: |
+        # Clear Cloudflare cache
+        curl -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/purge_cache" \
+          -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          --data '{"purge_everything":true}'
+
+    - name: Warm up cache
+      run: |
+        # Warm up critical endpoints
+        FRONTEND_URL="https://raffleplatform.com"
+        API_URL="https://api.raffleplatform.com"
+        
+        if [ "${{ needs.pre-deployment.outputs.environment }}" == "staging" ]; then
+          FRONTEND_URL="https://staging.raffleplatform.com"
+          API_URL="https://api-staging.raffleplatform.com"
+        fi
+        
+        # Warm up frontend
+        curl -s "$FRONTEND_URL" > /dev/null
+        curl -s "$FRONTEND_URL/raffles" > /dev/null
+        curl -s "$FRONTEND_URL/dashboard" > /dev/null
+        
+        # Warm up API
+        curl -s "$API_URL/api/v1/raffles" > /dev/null
+        curl -s "$API_URL/api/v1/items" > /dev/null
+
+    - name: Update deployment status
+      run: |
+        # Update deployment tracking
+        curl -X POST \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "state": "success",
+            "description": "Deployment completed successfully",
+            "context": "deployment/${{ needs.pre-deployment.outputs.environment }}"
+          }' \
+          "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}"
+
+  # Notifications
+  notify-deployment:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [pre-deployment, deploy-application, smoke-tests, post-deployment]
+    if: always()
+    
+    steps:
+    - name: Notify Slack on success
+      if: success()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        channel: '#deployments'
+        text: |
+          🚀 Deployment to ${{ needs.pre-deployment.outputs.environment }} completed successfully!
+          Version: ${{ needs.pre-deployment.outputs.version }}
+          Environment: ${{ needs.pre-deployment.outputs.environment }}
+          Commit: ${{ github.sha }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    - name: Notify Slack on failure
+      if: failure()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        channel: '#deployments'
+        text: |
+          ❌ Deployment to ${{ needs.pre-deployment.outputs.environment }} failed!
+          Version: ${{ needs.pre-deployment.outputs.version }}
+          Environment: ${{ needs.pre-deployment.outputs.environment }}
+          Commit: ${{ github.sha }}
+          Please check the logs and rollback has been initiated.
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    - name: Create GitHub release
+      if: success() && needs.pre-deployment.outputs.environment == 'production' && startsWith(github.ref, 'refs/tags/')
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ needs.pre-deployment.outputs.version }}
+        release_name: Release ${{ needs.pre-deployment.outputs.version }}
+        body: |
+          ## Changes in this Release
+          
+          - Deployed to production successfully
+          - All smoke tests passed
+          - Database migrations completed
+          - Smart contracts verified
+          
+          ## Deployment Details
+          - Environment: Production
+          - Version: ${{ needs.pre-deployment.outputs.version }}
+          - Commit: ${{ github.sha }}
+          - Deployed at: ${{ github.event.head_commit.timestamp }}
+        draft: false
+        prerelease: false

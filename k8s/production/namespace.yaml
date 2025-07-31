@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: raffle-platform
+  labels:
+    name: raffle-platform
+    environment: production
